@@ -2,18 +2,59 @@
 
 > **Automated PII detection for database schemas using machine learning**
 
-A production-ready pipeline that classifies database columns into a comprehensive 10-class PII taxonomy with **98.34% accuracy**, using only metadata (`table_name`, `column_name`, `data_type`).
+## What This Pipeline Does
 
-This project demonstrates that classical TF-IDF features outperform fine-tuned transformer models for structured data classification, achieving state-of-the-art results with efficient CPU-only inference.
+This ML pipeline automatically identifies which database columns contain sensitive data by analyzing only the column metadata.
+
+**The Problem:** Organizations need to catalog PII across hundreds of databases for compliance (GDPR, CCPA), but manual schema audits are slow, expensive, and error-prone. Existing tools rely on column name pattern matching (simple regex), which misses edge cases and produces false positives.
+
+**The Solution:** This ML pipeline analyzes column metadata (`table_name`, `column_name`, `data_type`) and predicts which of 10 PII categories each column belongs to:
+
+- `person_name` - Names of individuals
+- `email` - Email addresses
+- `phone` - Phone numbers
+- `physical_address` - Street addresses and location data
+- `government_id` - SSN, passport numbers, driver's licenses
+- `date_of_birth` - Birth dates and ages
+- `financial_account` - Credit cards, bank accounts
+- `online_identifier` - Usernames, IP addresses, device IDs
+- `demographic_attribute` - Gender, ethnicity, race
+- `non_pii` - Everything else
+
+**How It Works:**
+
+1. **Synthetic data generation**: Uses dual-LLM approach (Claude Haiku generates, Claude Sonnet labels) to create 10k training examples
+2. **Feature engineering**: Extracts character n-grams (2-5) and word n-grams (1-2) from column metadata
+3. **Model training**: Compares 9 configurations (TF-IDF variants + fine-tuned transformers)
+4. **Calibration**: Temperature scaling for reliable confidence scores
+5. **Deployment**: Production-ready classifier with **98.34% accuracy** at **1.66ms latency**
+
+**Real-World Usage:**
+```python
+# Input: Database column metadata
+columns = [
+    {"table": "users", "column": "email_addr", "type": "VARCHAR"},
+    {"table": "customers", "column": "dob", "type": "DATE"},
+    {"table": "orders", "column": "order_id", "type": "INT"}
+]
+
+# Output: PII classifications with confidence
+predictions = classifier.predict(columns)
+# → ["email" (99.8%), "date_of_birth" (97.2%), "non_pii" (99.1%)]
+```
+
+**Key Achievement:** Classical TF-IDF features outperform fine-tuned transformer models by **+1.2%** while being 75x faster and 175x cheaper to run.
 
 ## Key Results
 
 - **Best Model:** TF-IDF Combined + LinearSVC → **98.34% accuracy**
-- **Fine-tuned Transformers:** BGE-Small + ClassifierHead/XGBoost → 96.67% accuracy
-- **Inference Speed:** 1.7ms per column (4,468 columns/sec throughput)
+- **Fine-tuned Transformers:** BGE-Small + XGBoost → **97.14% accuracy**
+- **Classical > Transformers:** TF-IDF beats fine-tuned BGE by **+1.2%**
+- **Inference Speed:** 1.66ms per column (4,749 columns/sec throughput)
 - **Deployment:** Lightweight (3.6 MB), CPU-only, calibrated probabilities
+- **Cost Efficiency:** 175x cheaper than GPU-based transformers with better accuracy
 
-See [MODEL_EVALUATION_REPORT.md](MODEL_EVALUATION_REPORT.md) for practitioner guidance and [ML_SCIENTIFIC_ANALYSIS.md](ML_ANALYSIS.md) for research-oriented analysis.
+**See [MODEL_EVALUATION_RESULTS.md](MODEL_EVALUATION_RESULTS.md) for comprehensive analysis, per-class metrics, and deployment recommendations.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
@@ -22,7 +63,7 @@ See [MODEL_EVALUATION_REPORT.md](MODEL_EVALUATION_REPORT.md) for practitioner gu
 - [Quick Start](#quick-start)
 - [Pipeline Architecture](#pipeline-architecture)
 - [Module Reference](#module-reference)
-- [Evaluation Methods](#evaluation-methods)
+- [Model Evaluation](#model-evaluation)
 - [Review Scripts](#review-scripts)
 - [Colab + GitHub](#colab--github)
 - [Caveats](#caveats)
@@ -305,74 +346,61 @@ python src/train_models.py --run-name test --skip-minilm  # TF-IDF only (note: f
 python src/train_models.py --raw-csv path/to/custom.csv
 ```
 
-## Evaluation Methods
+## Model Evaluation
 
-### Checkpoint Evaluation (`src/evaluate_checkpoints.py`)
+### Performance Summary
 
-**Purpose:** Empirically checks if more fine-tuning epochs would help by re-embedding existing splits with each saved epoch checkpoint.
+Evaluated 9 model configurations on 1,503 held-out examples. **Winner: TF-IDF Combined + LinearSVC**
 
-**Process:**
-1. Loads existing train/test/eval splits from a run
-2. For each saved epoch checkpoint:
-   - Re-embeds data with that checkpoint
-   - Trains LinearSVC/XGBoost on top
-   - Records accuracy
-3. No additional fine-tuning required
-4. ClassifierHead is skipped (tied to final model only)
+| Rank | Model | EVAL Accuracy | Latency | Size |
+|------|-------|---------------|---------|------|
+| 1 | **TF-IDF Combined + LinearSVC** | **98.34%** | **1.66ms** | **3.6 MB** |
+| 2 | TF-IDF Word + LinearSVC | 98.00% | 0.71ms | 1.9 MB |
+| 3 | Fine-tuned BGE + XGBoost | 97.14% | 14.3ms | 128 MB |
 
-**Usage:**
+### Key Findings
+
+1. **Classical features beat transformers**: TF-IDF (98.34%) outperforms fine-tuned BGE (97.14%) by +1.2% while being 75x faster and 36x smaller
+
+2. **Character + word n-grams essential**: Combined features (98.34%) > word-only (98.00%) > char-only (96.61%)
+
+3. **Perfect classification on email class**: 100% F1-score, all other classes ≥97.1% F1
+
+4. **Excellent calibration**: Temperature scaling reduces ECE from 0.475 → 0.005 (91% improvement)
+
+5. **Production-ready efficiency**:
+   - 4,749 columns/sec throughput
+   - CPU-only inference (no GPU costs)
+   - 175x cheaper than transformer models
+
+**For detailed analysis including per-class metrics, error analysis, calibration curves, and deployment recommendations, see [MODEL_EVALUATION_RESULTS.md](MODEL_EVALUATION_RESULTS.md)**
+
+### Evaluation Scripts
+
+#### Checkpoint Evaluation (`src/evaluate_checkpoints.py`)
+
+Validates optimal fine-tuning epochs by re-embedding splits with each saved checkpoint.
+
 ```bash
-# Evaluate explicitly named run
 python src/evaluate_checkpoints.py --run-name v3_baseline
-
-# Use latest run automatically
-python src/evaluate_checkpoints.py
-
-# TF-IDF only
-python src/evaluate_checkpoints.py --skip-minilm
 ```
 
-**Outputs:**
-- Results written to `results/{run_id}/epoch_accuracy_comparison.csv`
+**Outputs:** `results/{run_id}/epoch_accuracy_comparison.csv`
 
-### Probability Evaluation (`src/evaluate_probabilities.py`)
+#### Probability Evaluation (`src/evaluate_probabilities.py`)
 
-**Purpose:** Re-evaluates an existing run with probability predictions and temperature calibration.
+Comprehensive calibration analysis with temperature scaling.
+
+```bash
+python src/evaluate_probabilities.py --run-name v3_baseline
+```
 
 **Process:**
-1. Loads existing run's splits and label mapping
-2. Loads stock BGE-Small and fine-tuned models (no network access needed)
-3. Loads all classifiers (LinearSVC, XGBoost, ClassifierHead)
-4. Fits temperature calibration on **TEST** split
-5. Reports calibrated vs uncalibrated metrics on **EVAL** split
+- Fits temperature scaling on TEST split
+- Reports calibrated metrics on EVAL split
+- Generates confusion matrices and error analysis
 
-**Why Calibrate on Test, Report on Eval:**
-Methodology intentionally separates calibration fitting (test) from final evaluation (eval) to avoid overfitting the calibration temperature.
-
-**Usage:**
-```bash
-# Evaluate explicitly named run
-python src/evaluate_probabilities.py --run-name v3_baseline
-
-# Use latest run automatically
-python src/evaluate_probabilities.py
-
-# TF-IDF only
-python src/evaluate_probabilities.py --run-name baseline --skip-minilm
-
-# Skip XGBoost, no temperature calibration
-python src/evaluate_probabilities.py --run-name baseline --skip-gbt --calibration none
-
-# Add infrastructure cost estimate
-python src/evaluate_probabilities.py --run-name baseline --hourly-rate-usd 2.50
-```
-
-**Outputs:**
-- Probability matrices: `results/{run_id}/probabilities/`
-- Fitted artifacts: `models/{run_id}/prob_eval/`
-- Summary report: `results/{run_id}/probabilities/slide_ready_summary.md`
-  - Sorted by EVAL accuracy
-  - Includes macro-F1 across all classes and across classes with support > 0
+**Outputs:** `results/{run_id}/probabilities/` (metrics, confusion matrices, high-confidence errors)
 
 ## Review Scripts
 
@@ -570,19 +598,6 @@ See **[COLAB.md](COLAB.md)** for instructions on running the pipeline on Google 
 - **Health information excluded:** Medical/health PII is out of scope per the current taxonomy.
 - **Column names only:** This classifier uses metadata only. For complete PII detection, combine with content analysis.
 - **English language:** Optimized for English database naming conventions.
-
-## Citation
-
-If you use this work in your research or project, please cite:
-
-```bibtex
-@software{pii_column_classifier,
-  author = {Yang, Carina},
-  title = {PII Column Classifier: Automated PII Detection for Database Schemas},
-  year = {2026},
-  url = {https://github.com/carina-yang/pii-column-classifier}
-}
-```
 
 ## License
 
